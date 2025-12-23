@@ -4,6 +4,13 @@ import pygame
 import sys
 from abc import abstractmethod, ABC, ABCMeta
 
+
+### 
+### TODO add random clicks for lots of training data
+### TODO imporove model for better accuracy
+### TODO hot spots (heatmap)
+### 
+
 import torch
 from torch import nn
 from torchvision.transforms import v2
