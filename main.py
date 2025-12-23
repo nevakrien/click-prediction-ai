@@ -19,6 +19,7 @@ class Window:
 
 @dataclass
 class Game:
+    ai: list
     draw: pygame.draw
     window: Window
     clock: pygame.time.Clock
@@ -89,10 +90,10 @@ def predictions(predictor, marker, game):
 
     ## Only allow AI to run if we have enough data samples
     print(numberCoords)
-    if numberCoords < 8:
+    if numberCoords < 6:
         return
 
-    features = clicks[-8:-2]
+    features = clicks[-6:-2]
     label = clicks[-2:]
     #output = predictor([features])
     prediction = predictor.train(features, label)
@@ -103,6 +104,7 @@ class NNPredictor(nn.Module):
         super().__init__()
         ## TODO use GPU??!?!?!?!?
         ## TODO use GPU??!?!?!?!?
+        self.game = game
         self.device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
         ## TODO use GPU??!?!?!?!?
         ## TODO use GPU??!?!?!?!?
@@ -114,15 +116,16 @@ class NNPredictor(nn.Module):
              torch.as_tensor([game.window.width, game.window.height])
         )
         self.model = torch.nn.Sequential(
-            torch.nn.Linear(6, 16),
+            torch.nn.Linear(4, 32),
             torch.nn.ReLU(),
-            torch.nn.Linear(16, 16),
+            torch.nn.Linear(32, 32),
             torch.nn.ReLU(),
-            torch.nn.Linear(16, 2),
+            torch.nn.Linear(32, 2),
             torch.nn.Sigmoid(),
         )
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-3)
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-1)
         self.loss = torch.nn.MSELoss()
+        self.losses = []
 
     def encoder(self, features):
         features = torch.as_tensor(features, dtype=torch.float32)
@@ -146,27 +149,30 @@ class NNPredictor(nn.Module):
     def train(self, features, labels):
         output = self.forward(features)
         labels = torch.as_tensor(labels, dtype=torch.float32)
-        print(f"output: {output}")
-        print(f"labels: {labels}")
-        print(f"features: {features}")
         loss = self.loss(output, labels)
+        self.losses.append(loss)
+        cost = sum(self.losses) / len(self.losses)
         print(f"loss: {loss}")
+        print(f"cost: {cost}")
+
+        coords = output.detach().cpu().numpy()
+        print(f"coords: {(coords[0], coords[1])}")
+
+        ## Set AI Prediction Pixel XY Coords
+        self.game.ai = [int(coords[0]), int(coords[1])]
 
         loss.backward()
         self.optimizer.step()
         self.optimizer.zero_grad()
         return output
         ## TODO 
-        ## TODO 
-        ## TODO 
         ## TODO dispaly where AI thinks next click will be
         ## TODO  increase learn rate
         ## TODO 
+        ## TODO use Torch Optimzer for graph collapes
         ## TODO 
         ## TODO 
         ## TODO 
-        ## TODO 
-        #return [0,0]
         
 
 def main():
@@ -174,6 +180,7 @@ def main():
     pygame.init()
     marker = PointMarker()
     game = Game(
+        ai=[450, 250], ## coordiantes for the AI Prediction
         draw=pygame.draw,
         window=Window(
             width=900,
@@ -199,9 +206,9 @@ def main():
 
         game.draw.circle(
             game.window.screen,
-            (240, 120, 120),
-            (game.window.width / 2, game.window.height / 2),
-            12
+            (240, 220, 120),
+            (game.ai[0], game.ai[1]),
+            20
         )
         marker.draw(game)
         predictions(predictor, marker, game)
