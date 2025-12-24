@@ -3,10 +3,10 @@ from typing import override
 import pygame
 import sys
 from abc import abstractmethod, ABC, ABCMeta
-
+import json
 
 ### 
-### TODO add random clicks for lots of training data
+### TODO add random clicks for lots of training data (and learning rate)
 ### TODO imporove model for better accuracy
 ### TODO hot spots (heatmap)
 ### 
@@ -47,7 +47,15 @@ class PointMarker(Drawable):
         super().__init__()
         self.point_list: list[list] = []
         self.ai_point_list: list[list] = []
+        self.previous_clicks: list[list] = []
+        self.previous_clicks_position: int = 0
 
+    def add(self, point: list):
+        self.push([30, (point[0],point[1]), [
+            [[80,120, 80], 20],
+            [[160, 240, 160], 10]
+        ]])
+        
     def push(self, point: list):
         timer, pos, state = point
         x = pos[0]
@@ -60,14 +68,9 @@ class PointMarker(Drawable):
     def event_hook(self, event: pygame.event.Event):
         if event.type == pygame.MOUSEBUTTONDOWN:
             if event.button == pygame.BUTTON_LEFT:
-                print(
-                    event.dict,
-                    event.pos
-                )
-                self.push([30, event.pos, [
-                    [[80,120, 80], 20],
-                    [[160, 240, 160], 10]
-                ]])
+                self.previous_clicks.append([event.pos[0], event.pos[1]])
+                print(event.dict, event.pos)
+                self.add(event.pos)
     @override
     def draw(self, game: Game):
         for circle in self.point_list[:]:
@@ -94,13 +97,13 @@ def predictions(predictor, marker, game):
     predictor.clicks = numberCoords
 
     ## Only allow AI to run if we have enough data samples
-    print(numberCoords)
     if numberCoords < 6:
         return
 
+    ## TODO add more xy coords
+    ## TODO add more xy coords
     features = clicks[-6:-2]
     label = clicks[-2:]
-    #output = predictor([features])
     prediction = predictor.train(features, label)
     print(f"prediction:{prediction}")
 
@@ -125,8 +128,15 @@ class NNPredictor(nn.Module):
             torch.nn.Sigmoid(),
         )
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-1)
-        self.loss = torch.nn.MSELoss()
+        self.optimizer.param_groups[0]['weight_decay'] = 0.1
+        #self.loss = torch.nn.MSELoss()
+        #self.loss = torch.nn.L1Loss()
+        self.loss = self.loss
         self.losses = []
+
+    def loss(self, output, labels):
+        return torch.mean(torch.abs(output - labels).pow(0.5))
+        #return ((labels - output) ** 2).mean()
 
     def encoder(self, features):
         features = torch.as_tensor(features, dtype=torch.float32)
@@ -169,9 +179,21 @@ class NNPredictor(nn.Module):
         
 
 def main():
+    frame = 0
     fps = 60
     pygame.init()
     marker = PointMarker()
+
+    ## Load Previous Clicks
+    try:
+        with open("clicks.json", "r") as file:
+            marker.previous_clicks = json.load(file)
+        print(f"Previous Clicks: {marker.previous_clicks}")
+    except:
+        print(f"No previous click file loaded.")
+
+    previous_click_count = len(marker.previous_clicks)
+
     game = Game(
         ai=[450, 250], ## coordiantes for the AI Prediction
         draw=pygame.draw,
@@ -194,8 +216,16 @@ def main():
         for event in pygame.event.get():
             marker.event_hook(event)
             if event.type == pygame.QUIT:
+                with open("clicks.json", "w") as file:
+                    json.dump(marker.previous_clicks, file)
                 pygame.quit()
                 sys.exit()
+
+        if frame % 7 == 0 and \
+        previous_click_count > marker.previous_clicks_position:
+            click = marker.previous_clicks[marker.previous_clicks_position]
+            marker.previous_clicks_position += 1
+            marker.add((click[0], click[1]))
 
         game.draw.circle(
             game.window.screen,
@@ -207,6 +237,7 @@ def main():
         predictions(predictor, marker, game)
         pygame.display.flip()
         game.clock.tick(fps)
+        frame += 1
 
 if __name__ == "__main__":
     main()
