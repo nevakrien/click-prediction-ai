@@ -7,8 +7,14 @@ import json
 
 ### 
 ### TODO add random clicks for lots of training data (and learning rate)
+### TODO hot spots (heatmap) improve make prettier
+### TODO 
+### TODO IMPROVE MODEL
+### TODO LSTM????
 ### TODO imporove model for better accuracy
-### TODO hot spots (heatmap)
+### TODO reduce params
+### TODO increase number of input xy coords
+### TODO 
 ### 
 
 import torch
@@ -27,6 +33,8 @@ class Window:
 @dataclass
 class Game:
     ai: list
+    ai_history: list[list]
+    heatmap: pygame.Surface
     draw: pygame.draw
     window: Window
     clock: pygame.time.Clock
@@ -97,12 +105,12 @@ def predictions(predictor, marker, game):
     predictor.clicks = numberCoords
 
     ## Only allow AI to run if we have enough data samples
-    if numberCoords < 6:
+    if numberCoords < 8:
         return
 
     ## TODO add more xy coords
     ## TODO add more xy coords
-    features = clicks[-6:-2]
+    features = clicks[-8:-2]
     label = clicks[-2:]
     prediction = predictor.train(features, label)
     print(f"prediction:{prediction}")
@@ -119,16 +127,18 @@ class NNPredictor(nn.Module):
             'normalization',
              torch.as_tensor([game.window.width, game.window.height])
         )
+        ## Neva said to use CNN + also maybe LSTM in front?!?!?!
+        ## Neva said LSTM first, give it 3 guesses instaed of 1
         self.model = torch.nn.Sequential(
-            torch.nn.Linear(4, 32),
+            torch.nn.Linear(6, 8),
             torch.nn.ReLU(),
-            torch.nn.Linear(32, 32),
+            torch.nn.Linear(8, 8),
             torch.nn.ReLU(),
-            torch.nn.Linear(32, 2),
+            torch.nn.Linear(8, 2),
             torch.nn.Sigmoid(),
         )
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-1)
-        self.optimizer.param_groups[0]['weight_decay'] = 0.1
+        #self.optimizer.param_groups[0]['weight_decay'] = 0.1
         #self.loss = torch.nn.MSELoss()
         #self.loss = torch.nn.L1Loss()
         self.loss = self.loss
@@ -171,12 +181,30 @@ class NNPredictor(nn.Module):
 
         ## Set AI Prediction Pixel XY Coords
         self.game.ai = [int(coords[0]), int(coords[1])]
+        self.game.ai_history.append([int(coords[0]), int(coords[1])])
 
         loss.backward()
         self.optimizer.step()
         self.optimizer.zero_grad()
         return output
         
+def draw_heatmap(game):
+    ## TODO remove ai_history
+    coords = game.ai
+    size = (game.window.width, game.window.height)
+
+    #for i in range(10):
+    surface = pygame.Surface((40,40), pygame.SRCALPHA) 
+    surface.fill((255, 255, 255))
+    game.draw.circle(
+        surface,
+        (255,228,10,0),
+        #(25 * i, 25 * i, 2 * i, 128),
+        (20,20),
+        20 #- (2 * i)
+    )
+    #game.heatmap.blit(surface, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+    game.window.screen.blit(surface, (coords[0]+20, coords[1]+20), special_flags=pygame.BLEND_RGBA_MULT)
 
 def main():
     frame = 0
@@ -194,25 +222,22 @@ def main():
 
     previous_click_count = len(marker.previous_clicks)
 
+    size = (900, 500)
     game = Game(
         ai=[450, 250], ## coordiantes for the AI Prediction
+        ai_history=[],
+        heatmap=pygame.Surface(size, pygame.SRCALPHA),
         draw=pygame.draw,
-        window=Window(
-            width=900,
-            height=500
-        ),
+        window=Window(width=size[0], height=size[1]),
         clock=pygame.time.Clock()
     )
-    game.window.screen = pygame.display.set_mode(
-        (game.window.width, game.window.height)
-    )
+    game.window.screen = pygame.display.set_mode(size, pygame.SRCALPHA)
     predictor = NNPredictor(game)
+    background = pygame.Surface(size)
+    background.fill((100, 150, 200))
 
     while True:
-        game.window.screen.fill(
-            (40, 40, 60)
-        )
-
+        game.window.screen.fill((255,255,255,255))
         for event in pygame.event.get():
             marker.event_hook(event)
             if event.type == pygame.QUIT:
@@ -227,6 +252,8 @@ def main():
             marker.previous_clicks_position += 1
             marker.add((click[0], click[1]))
 
+        game.window.screen.blit(background, (0, 0))
+        draw_heatmap(game)
         game.draw.circle(
             game.window.screen,
             (240, 220, 120),
