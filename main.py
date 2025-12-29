@@ -5,6 +5,15 @@ import sys
 from abc import abstractmethod, ABC, ABCMeta
 import json
 
+import torch
+from torch import nn
+from torchvision.transforms import v2
+
+### TODO more than one training epoch
+### TODO 
+### TODO 
+### TODO 
+### TODO 
 ### 
 ### TODO add random clicks for lots of training data (and learning rate)
 ### TODO hot spots (heatmap) improve make prettier
@@ -17,9 +26,6 @@ import json
 ### TODO 
 ### 
 
-import torch
-from torch import nn
-from torchvision.transforms import v2
 
 def fade_color(color, factor):
     return [max(0, int(c * factor)) for c in color]
@@ -105,19 +111,20 @@ def predictions(predictor, marker, game):
     predictor.clicks = numberCoords
 
     ## Only allow AI to run if we have enough data samples
-    if numberCoords < 8:
+    if numberCoords < predictor.inputLength + 2:
         return
 
     ## TODO add more xy coords
     ## TODO add more xy coords
-    features = clicks[-8:-2]
+    features = clicks[-predictor.inputLength - 2:-2]
     label = clicks[-2:]
     prediction = predictor.train(features, label)
     print(f"prediction:{prediction}")
 
 class NNPredictor(nn.Module):
     def __init__(self, game):
-        super().__init__()
+        super(NNPredictor, self).__init__()
+        self.inputLength = 6
         self.game = game
         self.device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
         print(f"Accelerator devices is: {self.device}")
@@ -130,13 +137,29 @@ class NNPredictor(nn.Module):
         ## Neva said to use CNN + also maybe LSTM in front?!?!?!
         ## Neva said LSTM first, give it 3 guesses instaed of 1
         self.model = torch.nn.Sequential(
-            torch.nn.Linear(6, 8),
-            torch.nn.ReLU(),
-            torch.nn.Linear(8, 8),
-            torch.nn.ReLU(),
-            torch.nn.Linear(8, 2),
-            torch.nn.Sigmoid(),
+            ## TODO change input for CNN
+            nn.Conv2d(1, 6, 5),
+            nn.ReLU(),
+            nn.MaxPool2d(4, 4),
+            nn.Conv2d(6, 16, 5),
+            nn.ReLU(),
+            #nn.MaxPool2d(2, 2),
+            nn.MaxPool2d(4, 4),
+            nn.Flatten(),
+            nn.Linear(1650, 32),
+            nn.ReLU(),
+            nn.Linear(32, 16),
+            nn.ReLU(),
+            nn.Linear(16, 2),
         )
+        #self.model = torch.nn.Sequential(
+        #    nn.Linear(6, 8),
+        #    nn.ReLU(),
+        #    nn.Linear(8, 8),
+        #    nn.ReLU(),
+        #    nn.Linear(8, 2),
+        #    nn.Sigmoid(),
+        #)
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-1)
         #self.optimizer.param_groups[0]['weight_decay'] = 0.1
         #self.loss = torch.nn.MSELoss()
@@ -145,8 +168,24 @@ class NNPredictor(nn.Module):
         self.losses = []
 
     def loss(self, output, labels):
+        print("output",output)
         return torch.mean(torch.abs(output - labels).pow(0.5))
         #return ((labels - output) ** 2).mean()
+
+    ## TODO render the output
+    ## TODO render the output
+    ## TODO render the output
+    ## TODO render the output
+    def encoderCNN(self, coords, game):
+        ## TODO can be smaller input
+        width = game.window.width
+        height = game.window.height
+        output = torch.zeros(1, width, height) 
+        for pos in range(0, len(coords), 2):
+            x = coords[pos]
+            y = coords[pos+1]
+            output[0, x, y] = 1.0
+        return output
 
     def encoder(self, features):
         features = torch.as_tensor(features, dtype=torch.float32)
@@ -155,14 +194,33 @@ class NNPredictor(nn.Module):
         features = features.reshape(-1)
         return features
 
+    def encoderCNNold(self, features):
+        print('CNN ENCODER: ', features)
+        #matrix = features.detach().cpu().numpy()
+        matrix = features.reshape(1,5,5)
+        print('CNN MATRIX: ', matrix)
+        #matrix = torch.as_tensor([torch.as_tensor(matrix) for feature in features])
+        #matrix = [[matrix] for feature in features]
+        ## TODO if we use numpin impott numpy
+        #matrix = numpy.array(matrix)
+        #matrix = torch.as_tensor(matrix)
+        return matrix
+        
     def decoder(self, output):
         output = output.reshape(-1, 2)
         output = output * self.normalization
         output = output.reshape(-1)
         return output
 
+    ## RuntimeError: Expected 3D (unbatched) or 4D (batched) input to conv2d,
+    ## but got input of size: [6]
+
     def forward(self, features):
-        features = self.encoder(features)
+        #features = self.encoder(features)
+        print('features: ', features)
+        features = self.encoderCNN(features, self.game)
+        print('features Post encoderCNN: ', features)
+        #features = self.encoderCNN(features)
         output = self.model(features)
         decoded = self.decoder(output)
         return decoded
