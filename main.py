@@ -2,197 +2,28 @@ from dataclasses import dataclass
 from typing import override
 import pygame
 import sys
-from abc import abstractmethod, ABC, ABCMeta
+from abc import abstractmethod, ABCMeta
 import json
 
 import torch
 from torch import nn
 import torch.nn.functional as F
-from torchvision.transforms import v2
+import math
 
-### TODO more than one training epoch
-### TODO 
-### TODO 
-### TODO 
-### TODO 
-### 
-### TODO add random clicks for lots of training data (and learning rate)
-### TODO hot spots (heatmap) improve make prettier
-### TODO 
-### TODO IMPROVE MODEL
-### TODO LSTM????
-### TODO imporove model for better accuracy
-### TODO reduce params
-### TODO increase number of input xy coords
-### TODO 
-### 
-
-
-class DebugShape(nn.Module):
-    def __init__(self, name=None):
-        super().__init__()
-        self.name = name
-
-    def _prefix(self):
-        return f"[DebugShape{'' if self.name is None else ':'+self.name}]"
-
-    def forward(self, x):
-        p = self._prefix()
-        if isinstance(x, torch.Tensor):
-            print(p, "shape =", tuple(x.shape))
-        elif isinstance(x, (list, tuple)):
-            print(p, "list/tuple shapes =", [tuple(t.shape) for t in x])
-        elif isinstance(x, dict):
-            print(p, "dict shapes =", {k: tuple(v.shape) for k,v in x.items()})
-        else:
-            print(p, "unsupported type:", type(x))
-        return x
-
-
-class DebugValue(nn.Module):
-    def __init__(self, name=None, max_elements=20):
-        super().__init__()
-        self.name = name
-        self.max_elements = max_elements
-
-    def _prefix(self):
-        return f"[DebugValue{'' if self.name is None else ':'+self.name}]"
-
-    def _print_tensor(self, t):
-        p = self._prefix()
-        flat = t.flatten()
-        if flat.numel() <= self.max_elements:
-            print(p, "value =", t)
-        else:
-            shown = flat[:self.max_elements]
-            print(p, f"value (first {self.max_elements}/{flat.numel()}) =", shown)
-
-    def forward(self, x):
-        if isinstance(x, torch.Tensor):
-            self._print_tensor(x)
-        elif isinstance(x, (list, tuple)):
-            for i, t in enumerate(x):
-                print(self._prefix(), f"[{i}]")
-                self._print_tensor(t)
-        elif isinstance(x, dict):
-            for k, t in x.items():
-                print(self._prefix(), f"[{k}]")
-                self._print_tensor(t)
-        else:
-            print(self._prefix(), "unsupported type:", type(x))
-        return x
-
-
-class ContextConv(nn.Module):
-    def __init__(self, in_ch, out_ch, k=5):
-        super().__init__()
-        self.conv = nn.Conv2d(in_ch, out_ch, k, padding="same")
-        self.act = nn.LeakyReLU(0.01)
-        # self.act = nn.ReLU()
-        # self.act = nn.LogSoftmax()#smooth is nicer for more placticity
-
-
-    def forward(self, x):
-        y = self.conv(x)
-        y = self.act(y)
-        # y = torch.log_softmax(y,dim=1)
-
-        # channel pooling
-        maxvals = y.max(dim=1, keepdim=True).values    # (B,1,H,W)
-        first = y[:, 0:1, :, :] + maxvals             # updated channel 0
-        rest  = y[:, 1:, :, :]                        # untouched channels
-
-        out = torch.cat([first, rest], dim=1)         # (B,C,H,W)
-        return out
-
-class UNetContext(nn.Module):
-    def __init__(self, in_ch, base=8, out_ch=None):
-        super().__init__()
-        if out_ch is None:
-            out_ch = in_ch
-
-        self.down1 = ContextConv(in_ch,     base)
-        self.down2 = ContextConv(base,      base*2)
-        self.down3 = ContextConv(base*2,    base*4)
-
-        self.pool = nn.AvgPool2d(5,5)
-
-        self.bottom = ContextConv(base*4, base*8)
-
-        self.up3_conv = ContextConv(base*8 + base*4, base*4)
-        self.up2_conv = ContextConv(base*4 + base*2, base*2)
-        self.up1_conv = ContextConv(base*2 + base,   base)
-
-        self.final = nn.Conv2d(base, out_ch, 1)
-
-    def forward(self, x):
-        # down
-        d1 = self.down1(x)
-        p1 = self.pool(d1)
-
-        d2 = self.down2(p1)
-        p2 = self.pool(d2)
-
-        d3 = self.down3(p2)
-        p3 = self.pool(d3)
-
-        # bottleneck
-        b = self.bottom(p3)
-        DebugShape()(b)
-
-        # up
-        u3 = F.interpolate(b, size=d3.shape[2:], mode="bilinear", align_corners=False)
-        u3 = self.up3_conv(torch.cat([u3, d3], dim=1))
-
-        u2 = F.interpolate(u3, size=d2.shape[2:], mode="bilinear", align_corners=False)
-        u2 = self.up2_conv(torch.cat([u2, d2], dim=1))
-
-        u1 = F.interpolate(u2, size=d1.shape[2:], mode="bilinear", align_corners=False)
-        u1 = self.up1_conv(torch.cat([u1, d1], dim=1))
-
-        return self.final(u1)
-
-
-class SampleSpace(nn.Module):
-    def forward(self, x):
-        # x: (B, C, H, W)
-        B, C, H, W = x.shape
-        device = x.device
-
-        # spatial softmax
-        probs = torch.softmax(x.view(B, C, -1), dim=-1).view(B, C, H, W)
-
-        # coordinate grids
-        ys = torch.arange(H, device=device).float() / (H - 1)
-        xs = torch.arange(W, device=device).float() / (W - 1)
-
-        grid_x = xs.view(1, 1, 1, W).expand(B, C, H, W)
-        grid_y = ys.view(1, 1, H, 1).expand(B, C, H, W)
-
-        ex = (probs * grid_x).sum(dim=(2, 3))  # expected x in [0,1]
-        ey = (probs * grid_y).sum(dim=(2, 3))  # expected y in [0,1]
-
-        return torch.stack([ex, ey], dim=-1)    # (B, C, 2)
-
-class SoftClip(nn.Module):
-    def __init__(self, a=0.0, b=1.0):
-        super().__init__()
-        assert b > a, "b must be greater than a"
-        self.a = a
-        self.b = b
-
-    def forward(self, x):
-        soft = x / (1 + x.abs())          # softsign
-        return (soft + 1) * 0.5 * (self.b - self.a) + self.a
+### ==============================
+### Helpers
+### ==============================
 
 def fade_color(color, factor):
     return [max(0, int(c * factor)) for c in color]
+
 
 @dataclass
 class Window:
     width: int
     height: int
     screen: pygame.Surface | None = None
+
 
 @dataclass
 class Game:
@@ -202,6 +33,11 @@ class Game:
     draw: pygame.draw
     window: Window
     clock: pygame.time.Clock
+
+
+### ==============================
+### Drawable Base
+### ==============================
 
 class Drawable(metaclass=ABCMeta):
     @classmethod
@@ -214,20 +50,25 @@ class Drawable(metaclass=ABCMeta):
     def draw(cls, game: Game):
         pass
 
+
+### ==============================
+### Click Marker & Replay
+### ==============================
+
 class PointMarker(Drawable):
     def __init__(self):
         super().__init__()
         self.point_list: list[list] = []
-        self.ai_point_list: list[list] = []
+        self.ai_point_list: list[float] = []  # flat [x0,y0,x1,y1,...]
         self.previous_clicks: list[list] = []
         self.previous_clicks_position: int = 0
 
     def add(self, point: list):
-        self.push([30, (point[0],point[1]), [
-            [[80,120, 80], 20],
+        self.push([30, (point[0], point[1]), [
+            [[80, 120, 80], 20],
             [[160, 240, 160], 10]
         ]])
-        
+
     def push(self, point: list):
         timer, pos, state = point
         x = pos[0]
@@ -243,6 +84,7 @@ class PointMarker(Drawable):
                 self.previous_clicks.append([event.pos[0], event.pos[1]])
                 print(event.dict, event.pos)
                 self.add(event.pos)
+
     @override
     def draw(self, game: Game):
         for circle in self.point_list[:]:
@@ -257,191 +99,405 @@ class PointMarker(Drawable):
             if circle[0] <= 0:
                 self.point_list.remove(circle)
 
-def predictions(predictor, marker, game):
-    clicks = marker.ai_point_list
-    numberCoords = len(clicks)
 
-    ## Only run AI when user clicks
-    if predictor.clicks >= numberCoords:
-        return
+### ==============================
+### Spatial Transformer Model
+### ==============================
 
-    ## Set number of clicks so we don't run next frame again
-    predictor.clicks = numberCoords
+class ClickViT(nn.Module):
+    def __init__(
+        self,
+        window_size: int,
+        grid_size: tuple[int, int],
+        chan_dim: int = 8,      # full transformer dim
+        num_heads: int = 4,
+        depth: int = 4,
+    ):
+        super().__init__()
 
-    ## Only allow AI to run if we have enough data samples
-    if numberCoords < predictor.inputLength + 2:
-        return
+        self.window_size = window_size
+        self.grid_H, self.grid_W = grid_size
+        self.d_model = chan_dim
 
-    ## TODO add more xy coords
-    ## TODO add more xy coords
-    features = clicks[-predictor.inputLength - 2:-2]
-    label = clicks[-2:]
-    prediction = predictor.train(features, label)
-    print(f"prediction:{prediction}")
+        assert chan_dim % num_heads == 0, \
+            f"d_model={chan_dim} must be divisible by num_heads={num_heads}"
+        assert chan_dim % 4 == 0, \
+            f"d_model={chan_dim} must be multiple of 4 for 2D sin/cos"
+
+        # ---- [T,X,Y] → [C,X,Y] ----
+        # 1x1 Conv2d: linear over T at each pixel (x,y)
+        self.temporal_proj = nn.Sequential(
+            nn.Conv2d(window_size, chan_dim, kernel_size=1),
+            nn.BatchNorm2d(chan_dim),
+            nn.GELU(),
+        )
+
+        # ---- Spatial Transformer over H*W tokens ----
+        enc = nn.TransformerEncoderLayer(
+            d_model=chan_dim,
+            nhead=num_heads,
+            dim_feedforward=chan_dim * 4,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.spatial = nn.TransformerEncoder(enc, depth)
+
+        # stability
+        self.skip_gate = nn.Parameter(torch.tensor(0.1))
+        self.final_norm = nn.LayerNorm(chan_dim)
+
+        # ---- Output ----
+        self.head = nn.Linear(chan_dim, 1)
+        nn.init.zeros_(self.head.weight)
+        nn.init.zeros_(self.head.bias)
+
+        # ---- 2D Sin/Cos positional embedding ----
+        self.register_buffer(
+            "pos2d",
+            self.build_2d_sincos_embedding(self.grid_H, self.grid_W, chan_dim),
+            persistent=False,
+        )
+
+    # --------------------------------
+    # Positional Encoding (2-D sin/cos)
+    # --------------------------------
+    def build_2d_sincos_embedding(self, H, W, dim):
+        """
+        Returns (1, H*W, dim) tensor for additive 2D positional encoding.
+        """
+        half = dim // 2
+        dim_h = half
+        dim_w = half
+
+        def pos_enc(size, d):
+            pos = torch.arange(size, dtype=torch.float32).unsqueeze(1)  # (size,1)
+            div = torch.exp(
+                torch.arange(0, d, 2, dtype=torch.float32)
+                * (-math.log(10000.0) / d)
+            )  # (d/2,)
+            pe = torch.zeros(size, d)
+            pe[:, 0::2] = torch.sin(pos * div)
+            pe[:, 1::2] = torch.cos(pos * div)
+            return pe  # (size,d)
+
+        pe_x = pos_enc(W, dim_w)     # (W, dim/2)
+        pe_y = pos_enc(H, dim_h)     # (H, dim/2)
+
+        pe_x = pe_x.unsqueeze(0).expand(H, -1, -1)  # (H,W,dim/2)
+        pe_y = pe_y.unsqueeze(1).expand(-1, W, -1)  # (H,W,dim/2)
+
+        pe = torch.cat([pe_x, pe_y], dim=-1)  # (H,W,dim)
+        return pe.view(1, H * W, dim)         # (1,HW,dim)
+
+    # --------------------------------
+    # Forward
+    # --------------------------------
+    def forward(self, grid_seq: torch.Tensor):
+        """
+        grid_seq: (B, T, H, W)
+            T must equal self.window_size
+            H,W must equal grid_H,grid_W
+        """
+        B, T, H, W = grid_seq.shape
+        assert T == self.window_size
+        assert H == self.grid_H and W == self.grid_W
+
+        # Temporal linear over T at each pixel (x,y)
+        x = self.temporal_proj(grid_seq)          # (B,C,H,W)
+
+        # Flatten H,W -> tokens
+        tokens = x.permute(0, 2, 3, 1).reshape(B, H * W, self.d_model)  # (B,HW,C)
+
+        # Add 2D positional encoding
+        tokens_in = tokens + self.pos2d.to(tokens.device)               # (B,HW,C)
+
+        # Spatial transformer
+        out = self.spatial(tokens_in)
+
+        # Long residual + norm
+        out = out + self.skip_gate * tokens_in
+        out = self.final_norm(out)
+
+        # Project to logits map
+        logits = self.head(out)                    # (B,HW,1)
+        logits = logits.view(B, H, W, 1).permute(0, 3, 1, 2)  # (B,1,H,W)
+        return logits
+
+
+### ==============================
+### Predictor Wrapper (Batched)
+### ==============================
 
 class NNPredictor(nn.Module):
-
-    def __init__(self, game):
-        super(NNPredictor, self).__init__()
-        self.window_size = 6  # number of recent clicks to encode on the channel/color dimension
-        self.inputLength = self.window_size * 2
+    def __init__(
+        self,
+        game,
+        window_size: int = 6,
+        batch_size: int = 32,
+        max_history_examples: int = 128,
+    ):
+        super().__init__()
+        self.window_size = window_size
+        self.inputLength = self.window_size * 2  # flat length per example
         self.game = game
-        self.device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
-        print(f"Accelerator devices is: {self.device}")
-        print(f"Game Width and Height{[game.window.width, game.window.height]}")
-        self.clicks = 0
+        self.clicks = 0  # how many coords we've already trained on
+        self.batch_size = batch_size
+        self.max_history_examples = max_history_examples
+
+        # device
+        self.device = (
+            torch.accelerator.current_accelerator().type
+            if hasattr(torch, "accelerator") and torch.accelerator.is_available()
+            else ("cuda" if torch.cuda.is_available() else "cpu")
+        )
+        print("Device:", self.device)
+
         self.register_buffer(
-            'normalization',
-             torch.as_tensor([game.window.width, game.window.height], dtype=torch.float32)
+            "screen_size",
+            torch.as_tensor(
+                [game.window.width - 1, game.window.height - 1],
+                dtype=torch.float32,
+            ),
         )
 
-        last_layer = nn.Linear(16, 2)
-        nn.init.zeros_(last_layer.weight)
-        nn.init.zeros_(last_layer.bias)
+        # grid resolution for model (doesn't have to equal screen pixels)
+        self.grid_H = 32
+        self.grid_W = 64
 
-        ## Neva said to use CNN + also maybe LSTM in front?!?!?!
-        ## Neva said LSTM first, give it 3 guesses instaed of 1
-        self.model = torch.nn.Sequential(
-            ## TODO change input for CNN
-            # ContextConv(self.window_size,5,15),
-            # # ContextConv(5,5,4),
-            # ContextConv(5,8,15),
-            UNetContext(self.window_size,15,8),
-            SampleSpace(),
-            nn.Flatten(),
-            nn.Linear(16,32),
-            SoftClip(),
-            nn.Linear(32,16),
-            nn.Sigmoid(),
-            last_layer,
-            # SoftClip(-0.5,1.5),
-            nn.Sigmoid(),
-
+        self.model = ClickViT(
+            window_size=self.window_size,
+            grid_size=(self.grid_H, self.grid_W),
+            chan_dim=8,
+            num_heads=4,
+            depth=4,
         )
 
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=1e-4)
+        self.losses: list[torch.Tensor] = []
 
         self.to(self.device)
-        #self.model = torch.nn.Sequential(
-        #    nn.Linear(6, 8),
-        #    nn.ReLU(),
-        #    nn.Linear(8, 8),
-        #    nn.ReLU(),
-        #    nn.Linear(8, 2),
-        #    nn.Sigmoid(),Aa
-        #)
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=1.0e-1)
 
-        #self.optimizer.param_groups[0]['weight_decay'] = 0.1
-        #self.loss = torch.nn.MSELoss()
-        #self.loss = torch.nn.L1Loss()
-        self.loss = self.loss
-        self.losses = []
+    # ------------------------------
+    # Build batch of (features, labels) from click history
+    # ------------------------------
+    def _build_batch(self, flat_clicks):
+        """
+        flat_clicks: [x0, y0, x1, y1, ...] in pixel coordinates
 
-    ## RuntimeError: Expected 3D (unbatched) or 4D (batched) input to conv2d,
-    ## but got input of size: [6]
-    def forward(self, features):
-        #features = self.encoder(features)
-        print('features: ', features)
-        features = self.encoderCNN(features, self.game)
-        print('features Post encoderCNN: ', features)
-        output = self.model(features)
-        decoded = self.decoder(output)
-        return decoded
+        We build examples for each t:
+          - features_t: previous `window_size` clicks (flattened)
+          - label_t:    click at time t (pixel coords)
+        Then we pick up to `batch_size` of those (most recent).
+        """
+        num_coords = len(flat_clicks)
+        num_clicks = num_coords // 2
 
-    def loss(self, output, labels):
-        print("output",output)
-        # print("labels",labels)
-        return torch.mean(torch.abs(output - labels).pow(0.8))
-        #return ((labels - output) ** 2).mean()
+        if num_clicks <= self.window_size:
+            return None  # not enough data yet
 
-    ## TODO render the output
-    ## TODO render the output
-    ## TODO render the output
-    ## TODO render the output
-    def encoderCNN(self, coords, game):
-        ## TODO can be smaller input
-        width = game.window.width
-        height = game.window.height
-        output = torch.zeros(1, self.window_size, width, height, device=self.device)
+        # all possible label indices t
+        t_all = list(range(self.window_size, num_clicks))  # each t = label index
 
-        # Encode most recent clicks across channels (color dimension)
-        start = max(0, len(coords) - self.window_size * 2)
-        trimmed = coords[start:]
-        clicks = [(trimmed[i], trimmed[i + 1]) for i in range(0, len(trimmed), 2)]
+        # limit how far back we look for training
+        if len(t_all) > self.max_history_examples:
+            t_all = t_all[-self.max_history_examples:]
 
-        for channel, (x, y) in enumerate(clicks[-self.window_size:]):
-            decay = 0.3+0.5 ** (len(clicks) - channel)
-            output[0, channel, x, y] = decay
-        return output
+        # always include the latest index
+        t_last = t_all[-1]
 
-    def encoder(self, features):
-        features = torch.as_tensor(features, dtype=torch.float32)
-        features = features.reshape(-1, 2)
-        features = features / self.normalization
-        features = features.reshape(-1)
-        return features
+        if len(t_all) <= self.batch_size:
+            chosen = t_all
+        else:
+            # choose batch_size-1 spaced indices + t_last
+            needed = self.batch_size - 1
+            pool = t_all[:-1]
+            if len(pool) <= needed:
+                chosen_except = pool
+            else:
+                step = len(pool) / needed
+                chosen_except = [pool[int(i * step)] for i in range(needed)]
+            chosen = chosen_except + [t_last]
 
-    def encoderCNNold(self, features):
-        print('CNN ENCODER: ', features)
-        #matrix = features.detach().cpu().numpy()
-        matrix = features.reshape(1,5,5)
-        print('CNN MATRIX: ', matrix)
-        #matrix = torch.as_tensor([torch.as_tensor(matrix) for feature in features])
-        #matrix = [[matrix] for feature in features]
-        ## TODO if we use numpin impott numpy
-        #matrix = numpy.array(matrix)
-        #matrix = torch.as_tensor(matrix)
-        return matrix
-        
-    def decoder(self, output):
-        output = output.reshape(-1, 2)
-        output = output * self.normalization
-        output = output.reshape(-1)
-        return output
+        B = len(chosen)
+        features = torch.empty(
+            B, self.inputLength, device=self.device, dtype=torch.float32
+        )
+        labels = torch.empty(B, 2, device=self.device, dtype=torch.float32)
 
-    def train(self, features, labels):
-        for _ in range(7):
-            self.train_step(features,labels)
-        return self.train_step(features,labels)
+        for i, t in enumerate(chosen):
+            # window of previous window_size clicks
+            start = 2 * (t - self.window_size)
+            end = 2 * t
+            features[i, :] = torch.tensor(
+                flat_clicks[start:end], dtype=torch.float32, device=self.device
+            )
 
+            # label is click at index t
+            labels[i, :] = torch.tensor(
+                flat_clicks[2 * t : 2 * t + 2],
+                dtype=torch.float32,
+                device=self.device,
+            )
 
-    def train_step(self, features, labels):
-        output = self.forward(features)
-        labels = torch.as_tensor(labels, dtype=torch.float32, device=self.device)
-        loss = self.loss(output, labels)
-        self.losses.append(loss)
-        cost = sum(self.losses) / len(self.losses)
-        print(f"loss: {loss}")
-        print(f"cost: {cost}")
+        latest_index = B - 1
+        return features, labels, latest_index
 
-        coords = output.detach().cpu().numpy()
-        print(f"coords: {(coords[0], coords[1])}")
+    # ------------------------------
+    # Build (B,T,H,W) grid from feature batch
+    # ------------------------------
+    def _build_grid_seq(self, features):
+        """
+        features: (B, inputLength) in pixel coords [x0,y0,...,x_{T-1},y_{T-1}]
+        Returns:
+           grid_seq: (B, T, H, W)
+             - for each example, each timestep t has a 1 at the grid cell
+               corresponding to that click, 0 elsewhere.
+        """
+        B, L = features.shape
+        assert L == self.inputLength
+        T = self.window_size
+        H, W = self.grid_H, self.grid_W
 
-        ## Set AI Prediction Pixel XY Coords
-        self.game.ai = [int(coords[0]), int(coords[1])]
-        self.game.ai_history.append([int(coords[0]), int(coords[1])])
+        coords = features.view(B, T, 2)  # (B,T,2) in pixels
+
+        # normalize to [0,1], then to grid indices
+        xs = coords[..., 0] / self.screen_size[0] * (W - 1)
+        ys = coords[..., 1] / self.screen_size[1] * (H - 1)
+
+        x_idx = torch.clamp(xs.round().long(), 0, W - 1)
+        y_idx = torch.clamp(ys.round().long(), 0, H - 1)
+
+        grid_seq = torch.zeros(
+            B, T, H, W, device=self.device, dtype=torch.float32
+        )
+
+        b_idx = torch.arange(B, device=self.device).view(B, 1).expand(B, T)
+        t_idx = torch.arange(T, device=self.device).view(1, T).expand(B, T)
+
+        grid_seq[b_idx, t_idx, y_idx, x_idx] = 1.0
+        return grid_seq
+
+    # ------------------------------
+    # Forward on a batch of features
+    # ------------------------------
+    def forward_batch(self, features):
+        grid_seq = self._build_grid_seq(features)      # (B,T,H,W)
+        return self.model(grid_seq)                    # (B,1,H,W)
+
+    # ------------------------------
+    # Pixel-space expected distance loss (batched)
+    # ------------------------------
+    def _loss(self, logits, labels):
+        """
+        logits: (B,1,H,W)
+        labels: (B,2) pixel coords [x_px, y_px]
+        """
+        B, C, H, W = logits.shape
+        probs = torch.softmax(logits.view(B, -1), dim=-1).view(B, 1, H, W)
+
+        xs = torch.arange(W, device=logits.device).view(1, 1, 1, W)
+        ys = torch.arange(H, device=logits.device).view(1, 1, H, 1)
+
+        x_label = labels[:, 0].view(B, 1, 1, 1)
+        y_label = labels[:, 1].view(B, 1, 1, 1)
+
+        dx = xs - x_label
+        dy = ys - y_label
+        dist = torch.sqrt(dx * dx + dy * dy)  # (B,1,H,W)
+
+        loss_per_sample = (probs * dist).sum(dim=(1, 2, 3))
+        loss = loss_per_sample.mean()
+        return loss, probs
+
+    # ------------------------------
+    # Decode one sample from probs for UI
+    # ------------------------------
+    def _argmax_for_example(self, probs, sample_idx):
+        """
+        probs: (B,1,H,W)
+        sample_idx: which example in batch to decode for UI
+        """
+        p = probs[sample_idx : sample_idx + 1]  # (1,1,H,W)
+        _, _, H, W = p.shape
+        idx = p.view(-1).argmax().item()
+        y = idx // W
+        x = idx % W
+
+        X = int(round(x * self.screen_size[0].item() / (W - 1)))
+        Y = int(round(y * self.screen_size[1].item() / (H - 1)))
+        return X, Y
+
+    # ------------------------------
+    # One training step on click history
+    # ------------------------------
+    def train_on_clicks(self, flat_clicks):
+        """
+        flat_clicks: [x0,y0,x1,y1,...] from marker.ai_point_list
+        """
+        batch = self._build_batch(flat_clicks)
+        if batch is None:
+            return
+
+        features, labels, latest_idx = batch
+
+        logits = self.forward_batch(features)
+        loss, probs = self._loss(logits, labels)
+
+        self.losses.append(loss.detach())
+        cost = torch.stack(self.losses).mean()
+        print(f"loss {loss.item():.6f}  cost {cost.item():.6f}")
+
+        # Use latest example in batch for UI prediction
+        x, y = self._argmax_for_example(probs.detach(), latest_idx)
+        self.game.ai = [x, y]
+        self.game.ai_history.append([x, y])
 
         loss.backward()
         self.optimizer.step()
         self.optimizer.zero_grad()
-        return output
-        
+
+
+
+### ==============================
+### Prediction Wrapper
+### ==============================
+
+def predictions(predictor, marker, game):
+    clicks = marker.ai_point_list
+    num_coords = len(clicks)
+
+    # Don't run again if no new clicks since last frame
+    if predictor.clicks >= num_coords:
+        return
+
+    predictor.clicks = num_coords
+
+    # need at least window_size+1 clicks to have one example
+    if (num_coords // 2) <= predictor.window_size:
+        return
+
+    predictor.train_on_clicks(clicks)
+
+
+### ==============================
+### Heatmap
+### ==============================
+
 def draw_heatmap(game):
-    ## TODO remove ai_history
     coords = game.ai
     size = (game.window.width, game.window.height)
-    surface = pygame.Surface(size, pygame.SRCALPHA) 
+    surface = pygame.Surface(size, pygame.SRCALPHA)
     surface.fill((255, 255, 255, 255))
     for i in range(4):
-        game.draw.circle(
-            surface,
-            (255,253,253),
-            #(255 - 10 * i, 255 -  10 * i, 255 -  10* i, 255 -  10* i),
-            coords,
-            (4 * i)
-        )
+        game.draw.circle(surface, (255, 253, 253), coords, (4 * i))
         game.heatmap.blit(surface, (0, 0), special_flags=pygame.BLEND_RGB_MULT)
-    game.window.screen.blit(game.heatmap, (0,0))#, special_flags=pygame.BLEND_RGB_MULT)
+    game.window.screen.blit(game.heatmap, (0, 0))
+
+
+### ==============================
+### Main
+### ==============================
 
 def main():
     frame = 0
@@ -449,23 +505,22 @@ def main():
     pygame.init()
     marker = PointMarker()
 
-    ## Load Previous Clicks
     try:
-        with open("clicks.json", "r") as file:
-            marker.previous_clicks = json.load(file)
-        print(f"Previous Clicks: {marker.previous_clicks}")
+        with open("clicks.json", "r") as f:
+            marker.previous_clicks = json.load(f)
+        print("Loaded previous clicks")
     except:
-        print(f"No previous click file loaded.")
+        print("No click file")
 
-    previous_click_count = len(marker.previous_clicks)
+    prev = len(marker.previous_clicks)
 
     size = (900, 500)
     game = Game(
-        ai=[450, 250], ## coordiantes for the AI Prediction
+        ai=[450, 250],
         ai_history=[],
         heatmap=pygame.Surface(size, pygame.SRCALPHA),
         draw=pygame.draw,
-        window=Window(width=size[0], height=size[1]),
+        window=Window(size[0], size[1]),
         clock=pygame.time.Clock()
     )
     game.heatmap.fill((255, 255, 255))
@@ -475,34 +530,39 @@ def main():
     background.fill((100, 150, 200))
 
     while True:
-        game.window.screen.fill((255,255,255,255))
+        game.window.screen.fill((255, 255, 255, 255))
+
         for event in pygame.event.get():
             marker.event_hook(event)
             if event.type == pygame.QUIT:
-                with open("clicks.json", "w") as file:
-                    json.dump(marker.previous_clicks, file)
+                with open("clicks.json", "w") as f:
+                    json.dump(marker.previous_clicks, f)
                 pygame.quit()
                 sys.exit()
 
-        if frame % 7 == 0 and \
-        previous_click_count > marker.previous_clicks_position:
+        # replay old clicks if present
+        if frame % 7 == 0 and prev > marker.previous_clicks_position:
             click = marker.previous_clicks[marker.previous_clicks_position]
             marker.previous_clicks_position += 1
             marker.add((click[0], click[1]))
 
         game.window.screen.blit(background, (0, 0))
         draw_heatmap(game)
+
         game.draw.circle(
             game.window.screen,
             (240, 220, 120),
             (game.ai[0], game.ai[1]),
             20
         )
+
         marker.draw(game)
         predictions(predictor, marker, game)
+
         pygame.display.flip()
         game.clock.tick(fps)
         frame += 1
+
 
 if __name__ == "__main__":
     main()
