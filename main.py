@@ -27,6 +27,60 @@ from torchvision.transforms import v2
 ### 
 
 
+class DebugShape(nn.Module):
+    def __init__(self, name=None):
+        super().__init__()
+        self.name = name
+
+    def _prefix(self):
+        return f"[DebugShape{'' if self.name is None else ':'+self.name}]"
+
+    def forward(self, x):
+        p = self._prefix()
+        if isinstance(x, torch.Tensor):
+            print(p, "shape =", tuple(x.shape))
+        elif isinstance(x, (list, tuple)):
+            print(p, "list/tuple shapes =", [tuple(t.shape) for t in x])
+        elif isinstance(x, dict):
+            print(p, "dict shapes =", {k: tuple(v.shape) for k,v in x.items()})
+        else:
+            print(p, "unsupported type:", type(x))
+        return x
+
+
+class DebugValue(nn.Module):
+    def __init__(self, name=None, max_elements=20):
+        super().__init__()
+        self.name = name
+        self.max_elements = max_elements
+
+    def _prefix(self):
+        return f"[DebugValue{'' if self.name is None else ':'+self.name}]"
+
+    def _print_tensor(self, t):
+        p = self._prefix()
+        flat = t.flatten()
+        if flat.numel() <= self.max_elements:
+            print(p, "value =", t)
+        else:
+            shown = flat[:self.max_elements]
+            print(p, f"value (first {self.max_elements}/{flat.numel()}) =", shown)
+
+    def forward(self, x):
+        if isinstance(x, torch.Tensor):
+            self._print_tensor(x)
+        elif isinstance(x, (list, tuple)):
+            for i, t in enumerate(x):
+                print(self._prefix(), f"[{i}]")
+                self._print_tensor(t)
+        elif isinstance(x, dict):
+            for k, t in x.items():
+                print(self._prefix(), f"[{k}]")
+                self._print_tensor(t)
+        else:
+            print(self._prefix(), "unsupported type:", type(x))
+        return x
+
 def fade_color(color, factor):
     return [max(0, int(c * factor)) for c in color]
 
@@ -132,7 +186,7 @@ class NNPredictor(nn.Module):
         self.clicks = 0
         self.register_buffer(
             'normalization',
-             torch.as_tensor([game.window.width, game.window.height])
+             torch.as_tensor([game.window.width, game.window.height], dtype=torch.float32)
         )
         ## Neva said to use CNN + also maybe LSTM in front?!?!?!
         ## Neva said LSTM first, give it 3 guesses instaed of 1
@@ -151,7 +205,10 @@ class NNPredictor(nn.Module):
             nn.Linear(32, 16),
             nn.ReLU(),
             nn.Linear(16, 2),
+            # DebugValue()
+            # nn.Sigmoid(),
         )
+        self.to(self.device)
         #self.model = torch.nn.Sequential(
         #    nn.Linear(6, 8),
         #    nn.ReLU(),
@@ -169,7 +226,7 @@ class NNPredictor(nn.Module):
 
     def loss(self, output, labels):
         print("output",output)
-        print("labels",labels)
+        # print("labels",labels)
         return torch.mean(torch.abs(output - labels).pow(0.5))
         #return ((labels - output) ** 2).mean()
 
@@ -181,11 +238,12 @@ class NNPredictor(nn.Module):
         ## TODO can be smaller input
         width = game.window.width
         height = game.window.height
-        output = torch.zeros(1, 1, width, height) 
+        # Encode as [batch, x, y, channel] so channels stay last while marking click positions
+        output = torch.zeros(1, width, height, 1, device=self.device)
         for pos in range(0, len(coords), 2):
             x = coords[pos]
             y = coords[pos+1]
-            output[0, 0, x, y] = 1.0
+            output[0, x, y, 0] = 1.0
         return output
 
     def encoder(self, features):
@@ -222,13 +280,14 @@ class NNPredictor(nn.Module):
         features = self.encoderCNN(features, self.game)
         print('features Post encoderCNN: ', features)
         #features = self.encoderCNN(features)
+        features = features.permute(0, 3, 1, 2)
         output = self.model(features)
         decoded = self.decoder(output)
         return decoded
 
     def train(self, features, labels):
         output = self.forward(features)
-        labels = torch.as_tensor(labels, dtype=torch.float32)
+        labels = torch.as_tensor(labels, dtype=torch.float32, device=self.device)
         loss = self.loss(output, labels)
         self.losses.append(loss)
         cost = sum(self.losses) / len(self.losses)
