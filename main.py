@@ -81,6 +81,17 @@ class DebugValue(nn.Module):
             print(self._prefix(), "unsupported type:", type(x))
         return x
 
+#might be useful?
+class Clipper(nn.Module):
+    def __init__(self, a=0.01):
+        super().__init__()
+        self.a = a
+
+    def forward(self,x):
+        y = x/(1+x.abs()) # [-1 1]
+        return (self.a + 0.5) * y + 0.5 #[-a 1+a]
+
+
 def fade_color(color, factor):
     return [max(0, int(c * factor)) for c in color]
 
@@ -201,12 +212,12 @@ class NNPredictor(nn.Module):
             nn.MaxPool2d(2, 2),
             nn.Flatten(),
             nn.Linear(105600, 32),
-            nn.ReLU(),
+            nn.LeakyReLU(0.01),#try avoid dead neurons
             nn.Linear(32, 16),
-            nn.ReLU(),
+            nn.LeakyReLU(0.01),#try avoid dead neurons
             nn.Linear(16, 2),
             # DebugValue()
-            # nn.Sigmoid(),
+            # Clipper(),
         )
         self.to(self.device)
         #self.model = torch.nn.Sequential(
@@ -243,7 +254,8 @@ class NNPredictor(nn.Module):
         for pos in range(0, len(coords), 2):
             x = coords[pos]
             y = coords[pos+1]
-            output[0, x, y, 0] = 1.0
+            i =(len(coords)-pos)/2
+            output[0, x, y, 0] = 0.79 ** i #decay
         return output
 
     def encoder(self, features):
