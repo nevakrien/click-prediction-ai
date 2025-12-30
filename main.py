@@ -103,15 +103,14 @@ class PointMarker(Drawable):
 ### ==============================
 ### Spatial Transformer Model
 ### ==============================
-
 class ClickViT(nn.Module):
     def __init__(
         self,
         window_size: int,
-        grid_size: tuple[int, int],
-        chan_dim: int = 8,      # full transformer dim
-        num_heads: int = 4,
-        depth: int = 4,
+        grid_size: tuple[int,int],
+        chan_dim: int = 32,
+        num_heads: int = 2,
+        mlp_hidden: int = 128,
     ):
         super().__init__()
 
@@ -119,109 +118,150 @@ class ClickViT(nn.Module):
         self.grid_H, self.grid_W = grid_size
         self.d_model = chan_dim
 
-        assert chan_dim % num_heads == 0, \
-            f"d_model={chan_dim} must be divisible by num_heads={num_heads}"
-        assert chan_dim % 4 == 0, \
-            f"d_model={chan_dim} must be multiple of 4 for 2D sin/cos"
+        assert chan_dim % num_heads == 0
 
         # ---- [T,X,Y] → [C,X,Y] ----
-        # 1x1 Conv2d: linear over T at each pixel (x,y)
         self.temporal_proj = nn.Sequential(
-            nn.Conv2d(window_size, chan_dim, kernel_size=1),
+            nn.Conv2d(window_size, chan_dim, 1),
             nn.BatchNorm2d(chan_dim),
             nn.GELU(),
         )
 
-        # ---- Spatial Transformer over H*W tokens ----
-        enc = nn.TransformerEncoderLayer(
+        # ---- positional embedding ----
+        self.register_buffer(
+            "pos2d",
+            self._build_pos(self.grid_H, self.grid_W, chan_dim),
+            persistent=False
+        )
+
+        # ---- first light transformer ----
+        enc1 = nn.TransformerEncoderLayer(
             d_model=chan_dim,
             nhead=num_heads,
-            dim_feedforward=chan_dim * 4,
+            dim_feedforward=chan_dim * 2,
             activation="gelu",
             batch_first=True,
             norm_first=True,
         )
-        self.spatial = nn.TransformerEncoder(enc, depth)
+        self.transformer1 = nn.TransformerEncoder(enc1, 1)
 
-        # stability
-        self.skip_gate = nn.Parameter(torch.tensor(0.1))
+        # ---- big global brain ----
+        self.global_mlp = nn.Sequential(
+            nn.LayerNorm(chan_dim),
+            nn.Linear(chan_dim, mlp_hidden),
+            nn.GELU(),
+            nn.Linear(mlp_hidden, mlp_hidden),
+            nn.GELU(),
+            nn.Linear(mlp_hidden, chan_dim),
+        )
+
+        # projection to inject global context back
+        self.inject = nn.Linear(chan_dim, chan_dim)
+
+        # ---- second light transformer ----
+        enc2 = nn.TransformerEncoderLayer(
+            d_model=chan_dim,
+            nhead=num_heads,
+            dim_feedforward=chan_dim * 2,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer2 = nn.TransformerEncoder(enc2, 1)
+
+        # ---- global skips are gated ----
+        self.skip1_gate = nn.Parameter(torch.tensor(0.2))
+        self.skip2_gate = nn.Parameter(torch.tensor(0.2))
+
         self.final_norm = nn.LayerNorm(chan_dim)
 
-        # ---- Output ----
+        # ---- output head ----
         self.head = nn.Linear(chan_dim, 1)
         nn.init.zeros_(self.head.weight)
         nn.init.zeros_(self.head.bias)
 
-        # ---- 2D Sin/Cos positional embedding ----
-        self.register_buffer(
-            "pos2d",
-            self.build_2d_sincos_embedding(self.grid_H, self.grid_W, chan_dim),
-            persistent=False,
+        # # ---- output head (beefy) ----
+        # self.head = nn.Sequential(
+        #     nn.LayerNorm(chan_dim),
+
+        #     nn.Linear(chan_dim, chan_dim * 2),
+        #     nn.GELU(),
+
+        #     nn.Linear(chan_dim * 2, chan_dim),
+        #     nn.GELU(),
+
+        #     # residual stab
+        #     nn.LayerNorm(chan_dim),
+
+        #     nn.Linear(chan_dim, 1)
+        # )
+
+        # # start gentle — avoids insane spikes early learning
+        # for m in self.head:
+        #     if isinstance(m, nn.Linear):
+        #         nn.init.xavier_uniform_(m.weight, gain=0.5)
+        #         nn.init.zeros_(m.bias)
+
+
+    # --------------------------------
+    def _build_pos(self, H, W, dim):
+        assert dim % 4 == 0
+        half = dim // 2
+        yy, xx = torch.meshgrid(
+            torch.arange(H), torch.arange(W), indexing="ij"
         )
 
-    # --------------------------------
-    # Positional Encoding (2-D sin/cos)
-    # --------------------------------
-    def build_2d_sincos_embedding(self, H, W, dim):
-        """
-        Returns (1, H*W, dim) tensor for additive 2D positional encoding.
-        """
-        half = dim // 2
-        dim_h = half
-        dim_w = half
-
-        def pos_enc(size, d):
-            pos = torch.arange(size, dtype=torch.float32).unsqueeze(1)  # (size,1)
-            div = torch.exp(
-                torch.arange(0, d, 2, dtype=torch.float32)
-                * (-math.log(10000.0) / d)
-            )  # (d/2,)
-            pe = torch.zeros(size, d)
+        def enc(n, d):
+            pos = torch.arange(n, dtype=torch.float32).unsqueeze(1)
+            div = torch.exp(torch.arange(0, d, 2) * (-math.log(10000.0) / d))
+            pe = torch.zeros(n, d)
             pe[:, 0::2] = torch.sin(pos * div)
             pe[:, 1::2] = torch.cos(pos * div)
-            return pe  # (size,d)
+            return pe
 
-        pe_x = pos_enc(W, dim_w)     # (W, dim/2)
-        pe_y = pos_enc(H, dim_h)     # (H, dim/2)
-
-        pe_x = pe_x.unsqueeze(0).expand(H, -1, -1)  # (H,W,dim/2)
-        pe_y = pe_y.unsqueeze(1).expand(-1, W, -1)  # (H,W,dim/2)
-
-        pe = torch.cat([pe_x, pe_y], dim=-1)  # (H,W,dim)
-        return pe.view(1, H * W, dim)         # (1,HW,dim)
+        pe_x = enc(W, half).unsqueeze(0).expand(H, -1, -1)
+        pe_y = enc(H, half).unsqueeze(1).expand(-1, W, -1)
+        pe = torch.cat([pe_x, pe_y], dim=-1)
+        return pe.view(1, H * W, dim)
 
     # --------------------------------
-    # Forward
-    # --------------------------------
-    def forward(self, grid_seq: torch.Tensor):
+    def forward(self, grid_seq):
         """
-        grid_seq: (B, T, H, W)
-            T must equal self.window_size
-            H,W must equal grid_H,grid_W
+        grid_seq: (B,T,H,W)
         """
-        B, T, H, W = grid_seq.shape
-        assert T == self.window_size
-        assert H == self.grid_H and W == self.grid_W
+        B,T,H,W = grid_seq.shape
 
-        # Temporal linear over T at each pixel (x,y)
-        x = self.temporal_proj(grid_seq)          # (B,C,H,W)
+        # ---- temporal collapse ----
+        x = self.temporal_proj(grid_seq)            # (B,C,H,W)
 
-        # Flatten H,W -> tokens
-        tokens = x.permute(0, 2, 3, 1).reshape(B, H * W, self.d_model)  # (B,HW,C)
+        # flatten
+        tokens0 = x.permute(0,2,3,1).reshape(B, H*W, self.d_model)
+        tokens0 = tokens0 + self.pos2d             # positional add
 
-        # Add 2D positional encoding
-        tokens_in = tokens + self.pos2d.to(tokens.device)               # (B,HW,C)
+        # ---- Transformer 1 ----
+        x1 = self.transformer1(tokens0)
 
-        # Spatial transformer
-        out = self.spatial(tokens_in)
+        # ---- skip 1 ----
+        x1 = x1 + self.skip1_gate * tokens0
 
-        # Long residual + norm
-        out = out + self.skip_gate * tokens_in
-        out = self.final_norm(out)
+        # ---- global summary ----
+        g = x1.mean(dim=1)
+        g2 = self.global_mlp(g)
 
-        # Project to logits map
-        logits = self.head(out)                    # (B,HW,1)
-        logits = logits.view(B, H, W, 1).permute(0, 3, 1, 2)  # (B,1,H,W)
+        # inject global context everywhere
+        inj = self.inject(g2).unsqueeze(1)
+        z = x1 + inj
+
+        # ---- Transformer 2 ----
+        z2 = self.transformer2(z)
+
+        # ---- skip 2 ----
+        z2 = z2 + self.skip2_gate * z
+
+        out = self.final_norm(z2)
+
+        logits = self.head(out)          # (B,HW,1)
+        logits = logits.view(B,1,H,W)
         return logits
 
 
@@ -268,9 +308,6 @@ class NNPredictor(nn.Module):
         self.model = ClickViT(
             window_size=self.window_size,
             grid_size=(self.grid_H, self.grid_W),
-            chan_dim=8,
-            num_heads=4,
-            depth=4,
         )
 
         self.optimizer = torch.optim.Adam(self.parameters(), lr=1e-4)
