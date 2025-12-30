@@ -7,6 +7,7 @@ import json
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torchvision.transforms import v2
 
 ### TODO more than one training epoch
@@ -86,14 +87,15 @@ class ContextConv(nn.Module):
     def __init__(self, in_ch, out_ch, k=5):
         super().__init__()
         self.conv = nn.Conv2d(in_ch, out_ch, k, padding="same")
-        # self.act = nn.LeakyReLU(0.01)
-        self.act = nn.ReLU()
+        self.act = nn.LeakyReLU(0.01)
+        # self.act = nn.ReLU()
         # self.act = nn.LogSoftmax()#smooth is nicer for more placticity
 
 
     def forward(self, x):
         y = self.conv(x)
         y = self.act(y)
+        # y = torch.log_softmax(y,dim=1)
 
         # channel pooling
         maxvals = y.max(dim=1, keepdim=True).values    # (B,1,H,W)
@@ -102,6 +104,52 @@ class ContextConv(nn.Module):
 
         out = torch.cat([first, rest], dim=1)         # (B,C,H,W)
         return out
+
+class UNetContext(nn.Module):
+    def __init__(self, in_ch, base=8, out_ch=None):
+        super().__init__()
+        if out_ch is None:
+            out_ch = in_ch
+
+        self.down1 = ContextConv(in_ch,     base)
+        self.down2 = ContextConv(base,      base*2)
+        self.down3 = ContextConv(base*2,    base*4)
+
+        self.pool = nn.AvgPool2d(2,2)
+
+        self.bottom = ContextConv(base*4, base*8)
+
+        self.up3_conv = ContextConv(base*8 + base*4, base*4)
+        self.up2_conv = ContextConv(base*4 + base*2, base*2)
+        self.up1_conv = ContextConv(base*2 + base,   base)
+
+        self.final = nn.Conv2d(base, out_ch, 1)
+
+    def forward(self, x):
+        # down
+        d1 = self.down1(x)
+        p1 = self.pool(d1)
+
+        d2 = self.down2(p1)
+        p2 = self.pool(d2)
+
+        d3 = self.down3(p2)
+        p3 = self.pool(d3)
+
+        # bottleneck
+        b = self.bottom(p3)
+
+        # up
+        u3 = F.interpolate(b, size=d3.shape[2:], mode="bilinear", align_corners=False)
+        u3 = self.up3_conv(torch.cat([u3, d3], dim=1))
+
+        u2 = F.interpolate(u3, size=d2.shape[2:], mode="bilinear", align_corners=False)
+        u2 = self.up2_conv(torch.cat([u2, d2], dim=1))
+
+        u1 = F.interpolate(u2, size=d1.shape[2:], mode="bilinear", align_corners=False)
+        u1 = self.up1_conv(torch.cat([u1, d1], dim=1))
+
+        return self.final(u1)
 
 
 class SampleSpace(nn.Module):
@@ -124,6 +172,17 @@ class SampleSpace(nn.Module):
         ey = (probs * grid_y).sum(dim=(2, 3))  # expected y in [0,1]
 
         return torch.stack([ex, ey], dim=-1)    # (B, C, 2)
+
+class SoftClip(nn.Module):
+    def __init__(self, a=0.0, b=1.0):
+        super().__init__()
+        assert b > a, "b must be greater than a"
+        self.a = a
+        self.b = b
+
+    def forward(self, x):
+        soft = x / (1 + x.abs())          # softsign
+        return (soft + 1) * 0.5 * (self.b - self.a) + self.a
 
 def fade_color(color, factor):
     return [max(0, int(c * factor)) for c in color]
@@ -234,23 +293,31 @@ class NNPredictor(nn.Module):
             'normalization',
              torch.as_tensor([game.window.width, game.window.height], dtype=torch.float32)
         )
+
+        last_layer = nn.Linear(16, 2)
+        nn.init.zeros_(last_layer.weight)
+        nn.init.zeros_(last_layer.bias)
+
         ## Neva said to use CNN + also maybe LSTM in front?!?!?!
         ## Neva said LSTM first, give it 3 guesses instaed of 1
         self.model = torch.nn.Sequential(
             ## TODO change input for CNN
-            ContextConv(self.window_size,5,15),
-            # ContextConv(5,5,4),
-            ContextConv(5,8,15),
+            # ContextConv(self.window_size,5,15),
+            # # ContextConv(5,5,4),
+            # ContextConv(5,8,15),
+            UNetContext(self.window_size,15,8),
             SampleSpace(),
             nn.Flatten(),
             nn.Linear(16,32),
-            # nn.Dropout(0.5),
-            nn.Softmin(),#avoids weird shooting behiviors
-            nn.Linear(32,32),
-            nn.Softmin(),
-            nn.Linear(32,2),
+            SoftClip(),
+            nn.Linear(32,16),
             nn.Sigmoid(),
+            last_layer,
+            # SoftClip(-0.5,1.5),
+            nn.Sigmoid(),
+
         )
+
 
         self.to(self.device)
         #self.model = torch.nn.Sequential(
@@ -259,9 +326,9 @@ class NNPredictor(nn.Module):
         #    nn.Linear(8, 8),
         #    nn.ReLU(),
         #    nn.Linear(8, 2),
-        #    nn.Sigmoid(),
+        #    nn.Sigmoid(),Aa
         #)
-        self.optimizer = torch.optim.SGD(self.model.parameters(), lr=1e-1, weight_decay=1e-4)
+        self.optimizer = torch.optim.SGD(self.model.parameters(), lr=1.3e-2)
         #self.optimizer.param_groups[0]['weight_decay'] = 0.1
         #self.loss = torch.nn.MSELoss()
         #self.loss = torch.nn.L1Loss()
@@ -282,7 +349,7 @@ class NNPredictor(nn.Module):
     def loss(self, output, labels):
         print("output",output)
         # print("labels",labels)
-        return torch.mean(torch.abs(output - labels).pow(0.5))
+        return torch.mean(torch.abs(output - labels).pow(0.8))
         #return ((labels - output) ** 2).mean()
 
     ## TODO render the output
