@@ -223,7 +223,8 @@ class NNPredictor(nn.Module):
 
     def __init__(self, game):
         super(NNPredictor, self).__init__()
-        self.inputLength = 6
+        self.window_size = 6  # number of recent clicks to encode on the channel/color dimension
+        self.inputLength = self.window_size * 2
         self.game = game
         self.device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
         print(f"Accelerator devices is: {self.device}")
@@ -237,13 +238,13 @@ class NNPredictor(nn.Module):
         ## Neva said LSTM first, give it 3 guesses instaed of 1
         self.model = torch.nn.Sequential(
             ## TODO change input for CNN
-            ContextConv(1,5,15),
+            ContextConv(self.window_size,5,15),
             # ContextConv(5,5,4),
             ContextConv(5,8,15),
             SampleSpace(),
             nn.Flatten(),
             nn.Linear(16,32),
-            # nn.Dropout(0.2),
+            # nn.Dropout(0.5),
             nn.Softmin(),#avoids weird shooting behiviors
             nn.Linear(32,32),
             nn.Softmin(),
@@ -260,7 +261,7 @@ class NNPredictor(nn.Module):
         #    nn.Linear(8, 2),
         #    nn.Sigmoid(),
         #)
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-1)
+        self.optimizer = torch.optim.SGD(self.model.parameters(), lr=1e-1, weight_decay=1e-4)
         #self.optimizer.param_groups[0]['weight_decay'] = 0.1
         #self.loss = torch.nn.MSELoss()
         #self.loss = torch.nn.L1Loss()
@@ -292,13 +293,16 @@ class NNPredictor(nn.Module):
         ## TODO can be smaller input
         width = game.window.width
         height = game.window.height
-        # Encode as [batch, x, y, channel] so channels stay last while marking click positions
-        output = torch.zeros(1,1, width, height,device=self.device)
-        for pos in range(0, len(coords), 2):
-            x = coords[pos]
-            y = coords[pos+1]
-            i =(len(coords)-pos)/2
-            output[0,0, x, y] = 0.5 ** i #decay
+        output = torch.zeros(1, self.window_size, width, height, device=self.device)
+
+        # Encode most recent clicks across channels (color dimension)
+        start = max(0, len(coords) - self.window_size * 2)
+        trimmed = coords[start:]
+        clicks = [(trimmed[i], trimmed[i + 1]) for i in range(0, len(trimmed), 2)]
+
+        for channel, (x, y) in enumerate(clicks[-self.window_size:]):
+            decay = 0.3+0.5 ** (len(clicks) - channel)
+            output[0, channel, x, y] = decay
         return output
 
     def encoder(self, features):
