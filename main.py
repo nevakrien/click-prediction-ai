@@ -9,9 +9,9 @@ import torch
 from torch import nn
 from torchvision.transforms import v2
 
+### TODO Batching
 ### TODO more than one training epoch
-### TODO 
-### TODO 
+### TODO Shuffling
 ### TODO 
 ### TODO 
 ### 
@@ -172,7 +172,7 @@ def predictions(predictor, marker, game):
     ## TODO add more xy coords
     features = clicks[-predictor.inputLength - 2:-2]
     label = clicks[-2:]
-    prediction = predictor.train(features, label)
+    prediction = predictor.train([features], [label])
     print(f"prediction:{prediction}")
 
 class NNPredictor(nn.Module):
@@ -200,7 +200,7 @@ class NNPredictor(nn.Module):
             #nn.MaxPool2d(2, 2),
             nn.MaxPool2d(2, 2),
             nn.Flatten(),
-            nn.Linear(105600, 32),
+            nn.Linear(384, 32),
             nn.ReLU(),
             nn.Linear(32, 16),
             nn.ReLU(),
@@ -225,7 +225,7 @@ class NNPredictor(nn.Module):
         self.losses = []
 
     def loss(self, output, labels):
-        print("output",output)
+        #print("output",output)
         # print("labels",labels)
         return torch.mean(torch.abs(output - labels).pow(0.5))
         #return ((labels - output) ** 2).mean()
@@ -234,37 +234,33 @@ class NNPredictor(nn.Module):
     ## TODO render the output
     ## TODO render the output
     ## TODO render the output
-    def encoderCNN(self, coords, game):
-        ## TODO can be smaller input
-        width = game.window.width
-        height = game.window.height
+    def encoderCNN(self, features, game):
+        width = game.window.width   // 10
+        height = game.window.height // 10
+        outputs = []
         # Encode as [batch, x, y, channel] so channels stay last while marking click positions
-        output = torch.zeros(1, width, height, 1, device=self.device)
-        for pos in range(0, len(coords), 2):
-            x = coords[pos]
-            y = coords[pos+1]
-            output[0, x, y, 0] = 1.0
-        return output
+        for coords in features:
 
-    def encoder(self, features):
+            ## Generate Click Positions on the Canvas
+            image = torch.zeros(width, height, 1, device=self.device)
+            for pos in range(0, len(coords), 2):
+                x = coords[pos]   // 10
+                y = coords[pos+1] // 10
+                image[x, y, 0] = 1.0
+
+            outputs.append(image)
+
+        images = torch.stack(tuple(outputs)) 
+        print("images:", images.size())
+        return images
+
+    def encoderOLD(self, features):
         features = torch.as_tensor(features, dtype=torch.float32)
         features = features.reshape(-1, 2)
         features = features / self.normalization
         features = features.reshape(-1)
         return features
 
-    def encoderCNNold(self, features):
-        print('CNN ENCODER: ', features)
-        #matrix = features.detach().cpu().numpy()
-        matrix = features.reshape(1,5,5)
-        print('CNN MATRIX: ', matrix)
-        #matrix = torch.as_tensor([torch.as_tensor(matrix) for feature in features])
-        #matrix = [[matrix] for feature in features]
-        ## TODO if we use numpin impott numpy
-        #matrix = numpy.array(matrix)
-        #matrix = torch.as_tensor(matrix)
-        return matrix
-        
     def decoder(self, output):
         output = output.reshape(-1, 2)
         output = output * self.normalization
@@ -278,11 +274,12 @@ class NNPredictor(nn.Module):
         #features = self.encoder(features)
         print('features: ', features)
         features = self.encoderCNN(features, self.game)
-        print('features Post encoderCNN: ', features)
+        print('features Size: ', features.size())
+        #print('features Post encoderCNN: ', features)
         #features = self.encoderCNN(features)
         features = features.permute(0, 3, 1, 2)
         output = self.model(features)
-        decoded = self.decoder(output)
+        decoded = self.decoder(output[0])
         return decoded
 
     def train(self, features, labels):
@@ -374,7 +371,7 @@ def main():
         draw_heatmap(game)
         game.draw.circle(
             game.window.screen,
-            (240, 220, 120),
+            (255, 0, 255),
             (game.ai[0], game.ai[1]),
             20
         )
