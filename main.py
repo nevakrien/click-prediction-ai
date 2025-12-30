@@ -115,7 +115,7 @@ class UNetContext(nn.Module):
         self.down2 = ContextConv(base,      base*2)
         self.down3 = ContextConv(base*2,    base*4)
 
-        self.pool = nn.AvgPool2d(2,2)
+        self.pool = nn.AvgPool2d(5,5)
 
         self.bottom = ContextConv(base*4, base*8)
 
@@ -138,6 +138,7 @@ class UNetContext(nn.Module):
 
         # bottleneck
         b = self.bottom(p3)
+        DebugShape()(b)
 
         # up
         u3 = F.interpolate(b, size=d3.shape[2:], mode="bilinear", align_corners=False)
@@ -328,7 +329,8 @@ class NNPredictor(nn.Module):
         #    nn.Linear(8, 2),
         #    nn.Sigmoid(),Aa
         #)
-        self.optimizer = torch.optim.SGD(self.model.parameters(), lr=1.3e-2)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=1.0e-1)
+
         #self.optimizer.param_groups[0]['weight_decay'] = 0.1
         #self.loss = torch.nn.MSELoss()
         #self.loss = torch.nn.L1Loss()
@@ -398,6 +400,12 @@ class NNPredictor(nn.Module):
         return output
 
     def train(self, features, labels):
+        for _ in range(7):
+            self.train_step(features,labels)
+        return self.train_step(features,labels)
+
+
+    def train_step(self, features, labels):
         output = self.forward(features)
         labels = torch.as_tensor(labels, dtype=torch.float32, device=self.device)
         loss = self.loss(output, labels)
