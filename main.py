@@ -10,6 +10,7 @@ from torch import nn
 from torchvision.transforms import v2
 
 import math
+import numpy as np
 
 ### TODO Batching
 ### TODO more than one training epoch
@@ -83,6 +84,7 @@ class DebugValue(nn.Module):
             print(self._prefix(), "unsupported type:", type(x))
         return x
 
+
 def fade_color(color, factor):
     return [max(0, int(c * factor)) for c in color]
 
@@ -155,60 +157,23 @@ class PointMarker(Drawable):
             if circle[0] <= 0:
                 self.point_list.remove(circle)
 
+def draw_heatmap(game):
+    ## TODO remove ai_history
+    coords = game.ai
+    size = (game.window.width, game.window.height)
+    surface = pygame.Surface(size, pygame.SRCALPHA) 
+    surface.fill((255, 255, 255, 255))
+    for i in range(4):
+        game.draw.circle(
+            surface,
+            (255,253,253),
+            #(255 - 10 * i, 255 -  10 * i, 255 -  10* i, 255 -  10* i),
+            coords,
+            (4 * i)
+        )
+        game.heatmap.blit(surface, (0, 0), special_flags=pygame.BLEND_RGB_MULT)
+    game.window.screen.blit(game.heatmap, (0,0))#, special_flags=pygame.BLEND_RGB_MULT)
 
-def predictions(predictor, marker, game):
-    clicks = marker.ai_point_list
-    numberCoords = len(clicks)
-
-    # only run AI when new click happens
-    if predictor.clicks >= numberCoords:
-        return
-
-    predictor.clicks = numberCoords
-
-    need = predictor.inputLength + 2
-    if numberCoords < need:
-        return
-
-    features_batch = []
-    labels_batch = []
-
-    # Slide backward in steps of 2 (xy pair)
-    for end in range(numberCoords, 0, -2):
-        start_features = end - predictor.inputLength - 2
-        start_label    = end - 2
-
-        if start_features < 0:
-            break
-
-        f = clicks[start_features:start_label]
-        l = clicks[start_label:end]
-
-        if len(f) != predictor.inputLength:
-            continue
-        if len(l) != 2:
-            continue
-
-        features_batch.append(f)
-        labels_batch.append(l)
-
-        if len(features_batch) >= 128:
-            break
-
-    if not features_batch:
-        return
-
-    features_batch.reverse()
-    labels_batch.reverse()
-
-    # ---- TRAIN ----
-    predictor.fit_batch(features_batch, labels_batch)
-
-    # ---- PREDICT (deterministic, dropout disabled) ----
-    latest_features = features_batch[-1]
-    prediction = predictor.predict([latest_features])
-
-    print(f"prediction: {prediction}")
 
 # class SkipNet(nn.Module):
 #     def __init__(self, input_dim):
@@ -394,8 +359,11 @@ class NNPredictor(nn.Module):
         super().__init__()
 
         self.game = game
-        self.inputLength = 16
+        self.inputLength = 8
         self.clicks = 0
+
+        # single source of truth
+        self.train_data_size = 64
 
         self.device = (
             torch.accelerator.current_accelerator().type
@@ -404,26 +372,41 @@ class NNPredictor(nn.Module):
         )
         print("device:", self.device)
 
-        self.register_buffer(
-            "normalization",
-            torch.as_tensor(
-                [game.window.width, game.window.height],
-                dtype=torch.float32
-            )
-        )
+        # self.register_buffer(
+        #     "normalization",
+        #     torch.as_tensor(
+        #         [game.window.width, game.window.height],
+        #         dtype=torch.float32
+        #     )
+        # )
 
         input_dim = self.inputLength
 
         self.model = SkipNet(input_dim)
-        self.model.compile(dynamic=False)
+        # self.model.compile(dynamic=False)
 
         self.optimizer = torch.optim.AdamW(self.parameters(), lr=1e-2)
         self.losses = []
 
+        # ---------------------------------
+        # persistent numpy rolling buffers
+        # ---------------------------------
+        self.max_samples = self.train_data_size
+        self.sample_count = 0
+
+        self.features_np = np.zeros(
+            (self.max_samples, self.inputLength),
+            dtype=np.float32
+        )
+        self.labels_np = np.zeros(
+            (self.max_samples, 2),
+            dtype=np.float32
+        )
+
         self.to(self.device)
 
-    def loss(self, output, labels):
-        return torch.mean(torch.abs(output - labels).pow(0.5))
+    # def loss(self, output, labels):
+    #     return torch.mean(torch.abs(output - labels))
 
     def forward(self, x):
         return self.model(x)
@@ -431,152 +414,180 @@ class NNPredictor(nn.Module):
     def add_gradient_noise(self, std=1e-5):
         with torch.no_grad():
             for p in self.model.parameters():
-                if p.grad is not None:
-                    p.grad.add_(torch.randn_like(p.grad) * std)
+                if p.grad is None:
+                    continue
 
-    # -------------------------------------------------
-    # FIT BATCH (training mode)
-    # -------------------------------------------------
-    def fit_batch(
-        self,
-        features,
-        labels,
-        train_full=32,   # phase 1 steps
-        train_end=16,    # phase 2 steps
-        end_size=8,      # refined subset size
-        bias_full=0.15,  # exponential bias factor phase 1
-        bias_end=0.30    # exponential bias factor phase 2
-    ):
+                g = p.grad
+
+                # If NaN or Inf → kill it
+                if not torch.isfinite(g).all():
+                    print("NaN/Inf gradient detected → reset to 0")
+                    p.grad.zero_()
+                    raise ValueError("OVERFLOW")
+                    continue
+
+                noise = (torch.rand_like(g) * 2.0 - 1.0) * std  # uniform in [-std, std]
+                g.add_(noise)
+
+    # ======================================================
+    # BUFFER MGMT
+    # ======================================================
+    def append_sample(self, features, label):
+        if self.sample_count >= self.max_samples:
+            # simple FIFO rollover
+            self.features_np[:-1] = self.features_np[1:]
+            self.labels_np[:-1]   = self.labels_np[1:]
+            self.sample_count -= 1
+
+        self.features_np[self.sample_count] = np.asarray(features, dtype=np.float32)
+        self.labels_np[self.sample_count]   = np.asarray(label, dtype=np.float32)
+        self.sample_count += 1
+
+    # ======================================================
+    # FIT RECENT
+    # ======================================================
+    def fit_recent(self):
+        if self.sample_count == 0:
+            return
+
+        k = min(self.train_data_size, self.sample_count)
+
+        x = torch.tensor(
+            self.features_np[self.sample_count - k:self.sample_count],
+            dtype=torch.float32,
+            device=self.device
+        )
+        y = torch.tensor(
+            self.labels_np[self.sample_count - k:self.sample_count],
+            dtype=torch.float32,
+            device=self.device
+        )
+
         self.model.train()
 
-        x = torch.as_tensor(features, dtype=torch.float32, device=self.device)
-        y = torch.as_tensor(labels, dtype=torch.float32, device=self.device)
-
-        if x.dim() == 1:
-            x = x.unsqueeze(0)
-        if y.dim() == 1:
-            y = y.unsqueeze(0)
-
-        B = x.size(0)
-
-        total_steps = train_full + train_end
         lr_start = 1e-2
         lr_end   = 1e-3
+        train_full = 32
+        train_end  = 16
+        total_steps = train_full + train_end
         step_index = 0
 
-        # -------------------------------------------------
-        # helper: weighted loss for a batch
-        # newer samples get higher weight
-        # -------------------------------------------------
         def weighted_loss(pred, target, bias):
             N = pred.size(0)
+            idx = torch.arange(N, dtype=torch.float64, device=self.device)
 
-            # indices: 0 .. N-1  (newer = bigger index)
-            idx = torch.arange(N, dtype=torch.float32, device=self.device)
+            # shift so last = 1.0
+            w = torch.exp(bias * (idx - (N - 1)))
 
-            # exponential bias
-            w = torch.exp(bias * idx)
-
-            # normalize → weighted mean
+            # normalize
             w = w / w.sum()
 
-            per_sample = torch.mean(torch.abs(pred - target), dim=1)  # [N]
-            return torch.sum(per_sample * w)
+            res = torch.abs(pred - target)
+            safe = res.clamp_min(1e-6)
+            res = torch.minimum(safe.pow(0.8),res)
 
-        # ===============================
-        # Phase 1 — FULL batch
-        # ===============================
+            per = torch.mean(res, dim=1)
+            return torch.sum(per * w)
+
+
+        # ---- phase 1 ----
         for _ in range(train_full):
             t = step_index / (total_steps - 1)
-            lr = lr_end + 0.5 * (lr_start - lr_end) * (1 + math.cos(math.pi * t))
+            lr = lr_end + 0.5*(lr_start - lr_end)*(1+math.cos(math.pi*t))
             for pg in self.optimizer.param_groups:
                 pg["lr"] = lr
 
             self.optimizer.zero_grad()
-
-            pred = self.forward(x)
-            loss = weighted_loss(pred, y, bias_full)
-
+            pred = self.model(x)
+            loss = weighted_loss(pred, y, 0.15)
             self.losses.append(loss.detach())
             loss.backward()
             self.add_gradient_noise()
             self.optimizer.step()
-
             step_index += 1
 
-        # ===============================
-        # Phase 2 — SMALL refined subset
-        # ===============================
-        k = min(end_size, B)
-        xs = x[-k:]
-        ys = y[-k:]
+        # ---- phase 2 ----
+        k2 = min(8, k)
+        xs = x[-k2:]
+        ys = y[-k2:]
 
         for _ in range(train_end):
             t = step_index / (total_steps - 1)
-            lr = lr_end + 0.5 * (lr_start - lr_end) * (1 + math.cos(math.pi * t))
+            lr = lr_end + 0.5*(lr_start - lr_end)*(1+math.cos(math.pi*t))
             for pg in self.optimizer.param_groups:
                 pg["lr"] = lr
 
             self.optimizer.zero_grad()
-
-            pred = self.forward(xs)
-            loss = weighted_loss(pred, ys, bias_end)
-
+            pred = self.model(xs)
+            loss = weighted_loss(pred, ys, 0.3)
             self.losses.append(loss.detach())
             loss.backward()
             self.add_gradient_noise()
             self.optimizer.step()
-
             step_index += 1
 
         avg = sum(self.losses) / len(self.losses)
 
         print(
-            f"loss: {loss.item():.4f}  "
-            f"avg: {avg:.4f}  "
-            f"lr_final: {lr:.6f}  "
-            f"phase2_batch: {k}"
+            f"train loss: {loss.item():.4f}  "
+            # f"avg: {avg:.4f}  "
+            # f"lr_final: {lr:.6f}  "
+            # f"train_used: {k}"
         )
 
+    # ======================================================
+    # unified AI pipeline
+    # ======================================================
+    def update_predictor(self, marker):
+        clicks = marker.ai_point_list
+        numberCoords = len(clicks)
 
-    # -------------------------------------------------
-    # PREDICT (dropout OFF)
-    # -------------------------------------------------
-    def predict(self, features):
-        self.model.eval()     # <-- disables dropout
+        if numberCoords <= self.clicks:
+            return
 
+        self.clicks = numberCoords
+
+        need = self.inputLength + 2
+        if numberCoords < need:
+            return
+
+        # build ONLY new training windows
+        for end in range(numberCoords, 0, -2):
+            start_f = end - self.inputLength - 2
+            start_l = end - 2
+            if start_f < 0:
+                break
+
+            f = clicks[start_f:start_l]
+            l = clicks[start_l:end]
+
+            if len(f) == self.inputLength and len(l) == 2:
+                self.append_sample(f, l)
+
+        self.fit_recent()
+
+        # ---- predict newest ----
+        latest = clicks[-self.inputLength:]
+        x = torch.tensor([latest], dtype=torch.float32, device=self.device)
+
+        self.model.eval()
         with torch.no_grad():
-            x = torch.as_tensor(features, dtype=torch.float32, device=self.device)
-
-            if x.dim() == 1:
-                x = x.unsqueeze(0)
-
-            pred = self.forward(x)
+            pred = self.model(x)
 
         coords = pred[0].detach().cpu().numpy()
-
         self.game.ai = [int(coords[0]), int(coords[1])]
         self.game.ai_history.append(self.game.ai)
 
-        return pred
+        print("prediction:", pred)
 
-        
-def draw_heatmap(game):
-    ## TODO remove ai_history
-    coords = game.ai
-    size = (game.window.width, game.window.height)
-    surface = pygame.Surface(size, pygame.SRCALPHA) 
-    surface.fill((255, 255, 255, 255))
-    for i in range(4):
-        game.draw.circle(
-            surface,
-            (255,253,253),
-            #(255 - 10 * i, 255 -  10 * i, 255 -  10* i, 255 -  10* i),
-            coords,
-            (4 * i)
-        )
-        game.heatmap.blit(surface, (0, 0), special_flags=pygame.BLEND_RGB_MULT)
-    game.window.screen.blit(game.heatmap, (0,0))#, special_flags=pygame.BLEND_RGB_MULT)
+
+
+# ------------------------------------------------------
+# compatibility wrapper for old callsite
+# ------------------------------------------------------
+def predictions(predictor, marker, game):
+    predictor.update_predictor(marker)
+
 
 def main():
     frame = 0
