@@ -210,40 +210,183 @@ def predictions(predictor, marker, game):
 
     print(f"prediction: {prediction}")
 
+# class SkipNet(nn.Module):
+#     def __init__(self, input_dim):
+#         super().__init__()
+
+#         # stage 1
+#         self.block1 = nn.Sequential(
+#             nn.Linear(input_dim, 128),
+#             nn.ReLU(),
+#             nn.Dropout()
+#         )
+
+#         # stage 2
+#         self.block2 = nn.Sequential(
+#             nn.Linear(128, 16),
+#             nn.ReLU(),
+#             nn.Dropout()
+#         )
+
+#         concat_dim = input_dim + 128 + 16
+
+#         self.head = nn.Sequential(
+#             nn.Linear(concat_dim, 2),
+#             # nn.Sigmoid()
+#         )
+
+#     def forward(self, x):
+#         h1 = self.block1(x)     # [B, 128]
+#         h2 = self.block2(h1)    # [B, 16]
+
+#         cat = torch.cat([x, h1, h2], dim=-1)
+
+#         return self.head(cat)
+
+
+# class SkipNet(nn.Module):
+#     def __init__(
+#         self,
+#         input_dim: int,
+#         lstm_hidden: int = 16,   # tiny!
+#         proj_dim: int = 128,     # richer features after concat
+#         p_drop: float = 0.2,
+#     ):
+#         super().__init__()
+
+#         assert input_dim % 2 == 0, \
+#             "input_dim must be even: packed as [x, y, x, y, ...]"
+
+#         self.input_dim = input_dim
+#         self.step_dim = 2
+#         self.timesteps = input_dim // 2
+
+#         # ---- tiny LSTM over (x,y) pairs ----
+#         self.lstm = nn.LSTM(
+#             input_size=self.step_dim,
+#             hidden_size=lstm_hidden,
+#             num_layers=1,
+#             batch_first=True,
+#         )
+#         self.drop1 = nn.Dropout(p=p_drop)
+
+#         # ---- project ALL LSTM outputs ----
+#         # LSTM outputs: [B, T, lstm_hidden]
+#         # Flatten to:  [B, T * lstm_hidden]
+#         self.proj = nn.Sequential(
+#             nn.Linear(self.timesteps * lstm_hidden, proj_dim),
+#             nn.ReLU(),
+#             nn.Dropout(p=p_drop),
+#         )
+
+#         # ---- Stage 2 ----
+#         self.block2 = nn.Sequential(
+#             nn.Linear(proj_dim, 16),
+#             nn.ReLU(),
+#             nn.Dropout(p=p_drop),
+#         )
+
+#         # ---- Head ----
+#         concat_dim = input_dim + proj_dim + 16
+#         self.head = nn.Linear(concat_dim, 2)
+
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         """
+#         x: [B, input_dim]
+#            packed as [x0, y0, x1, y1, ..., x_{T-1}, y_{T-1}]
+#         """
+#         B, D = x.shape
+#         assert D == self.input_dim
+
+#         # ---- reshape to sequence ----
+#         seq = x.view(B, self.timesteps, self.step_dim)   # [B, T, 2]
+
+#         # ---- LSTM ----
+#         out, _ = self.lstm(seq)                          # [B, T, 16]
+#         out = self.drop1(out)
+
+#         # flatten all timestep outputs
+#         flat = out.reshape(B, -1)                        # [B, T*16]
+
+#         # ---- projection ----
+#         h1 = self.proj(flat)                             # [B, proj_dim]
+
+#         # ---- stage 2 ----
+#         h2 = self.block2(h1)                             # [B, 16]
+
+#         # ---- skip connection ----
+#         cat = torch.cat([x, h1, h2], dim=-1)
+
+#         return self.head(cat)
+
 class SkipNet(nn.Module):
-    def __init__(self, input_dim):
+    def __init__(
+        self,
+        input_dim: int,
+        conv_channels: int = 32,
+        kernel_size: int = 3,
+        proj_dim: int = 128,
+        p_drop: float = 0.5,
+    ):
         super().__init__()
 
-        # stage 1
-        self.block1 = nn.Sequential(
-            nn.Linear(input_dim, 128),
+        assert input_dim % 2 == 0, \
+            "input_dim must be even: packed as [x, y, x, y, ...]"
+
+        self.input_dim = input_dim
+        self.step_dim = 2
+        self.timesteps = input_dim // 2
+
+        # ===== cache sin/cos for exactly our length =====
+        t = torch.arange(self.timesteps).float()
+        sin = torch.sin(t * math.pi / self.timesteps)
+        cos = torch.cos(t * math.pi / self.timesteps)
+
+        self.register_buffer("sin_cache", sin.unsqueeze(-1))  # [T,1]
+        self.register_buffer("cos_cache", cos.unsqueeze(-1))  # [T,1]
+
+        # ===== tiny conv stack =====
+        self.conv = nn.Sequential(
+            nn.Conv1d(4, conv_channels, kernel_size, padding="same"),
             nn.ReLU(),
-            nn.Dropout()
+            nn.Dropout(p=p_drop),
         )
 
-        # stage 2
-        self.block2 = nn.Sequential(
-            nn.Linear(128, 16),
+        # ===== projection after flatten conv output =====
+        self.proj = nn.Sequential(
+            nn.Linear(self.timesteps * conv_channels, proj_dim),
             nn.ReLU(),
-            nn.Dropout()
+            nn.Dropout(p=p_drop),
         )
 
-        concat_dim = input_dim + 128 + 16
-
-        self.head = nn.Sequential(
-            nn.Linear(concat_dim, 2),
-            # nn.Sigmoid()
-        )
+        # ===== head uses original input + conv projection =====
+        concat_dim = input_dim + proj_dim
+        self.head = nn.Linear(concat_dim, 2)
 
     def forward(self, x):
-        h1 = self.block1(x)     # [B, 128]
-        h2 = self.block2(h1)    # [B, 16]
+        B, D = x.shape
+        assert D == self.input_dim
 
-        cat = torch.cat([x, h1, h2], dim=-1)
+        # ---- reshape to [B,T,2] ----
+        seq = x.view(B, self.timesteps, self.step_dim)
+
+        # ---- add cached sin/cos ----
+        sin = self.sin_cache.unsqueeze(0).expand(B, -1, -1)   # [B,T,1]
+        cos = self.cos_cache.unsqueeze(0).expand(B, -1, -1)   # [B,T,1]
+        seq = torch.cat([seq, sin, cos], dim=-1)              # [B,T,4]
+
+        # ---- conv expects [B,C,T] ----
+        seq = seq.permute(0, 2, 1)                            # [B,4,T]
+
+        feat = self.conv(seq)                                 # [B,C,T]
+        flat = feat.reshape(B, -1)                            # [B,T*C]
+
+        h = self.proj(flat)                                   # [B,proj_dim]
+
+        # ---- skip concat (original + conv features) ----
+        cat = torch.cat([x, h], dim=-1)
 
         return self.head(cat)
-
-
 
 
 class NNPredictor(nn.Module):
@@ -251,7 +394,7 @@ class NNPredictor(nn.Module):
         super().__init__()
 
         self.game = game
-        self.inputLength = 6
+        self.inputLength = 16
         self.clicks = 0
 
         self.device = (
@@ -272,6 +415,7 @@ class NNPredictor(nn.Module):
         input_dim = self.inputLength
 
         self.model = SkipNet(input_dim)
+        self.model.compile(dynamic=False)
 
         self.optimizer = torch.optim.AdamW(self.parameters(), lr=1e-2)
         self.losses = []
