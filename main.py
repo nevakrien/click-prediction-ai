@@ -298,8 +298,10 @@ class NNPredictor(nn.Module):
         features,
         labels,
         train_full=32,   # phase 1 steps
-        train_end=16,     # phase 2 steps
-        end_size=8       # refined subset size
+        train_end=16,    # phase 2 steps
+        end_size=8,      # refined subset size
+        bias_full=0.15,  # exponential bias factor phase 1
+        bias_end=0.30    # exponential bias factor phase 2
     ):
         self.model.train()
 
@@ -313,14 +315,29 @@ class NNPredictor(nn.Module):
 
         B = x.size(0)
 
-        # -------------------------------
-        # LR schedule across BOTH phases
-        # -------------------------------
         total_steps = train_full + train_end
         lr_start = 1e-2
         lr_end   = 1e-3
-
         step_index = 0
+
+        # -------------------------------------------------
+        # helper: weighted loss for a batch
+        # newer samples get higher weight
+        # -------------------------------------------------
+        def weighted_loss(pred, target, bias):
+            N = pred.size(0)
+
+            # indices: 0 .. N-1  (newer = bigger index)
+            idx = torch.arange(N, dtype=torch.float32, device=self.device)
+
+            # exponential bias
+            w = torch.exp(bias * idx)
+
+            # normalize → weighted mean
+            w = w / w.sum()
+
+            per_sample = torch.mean(torch.abs(pred - target), dim=1)  # [N]
+            return torch.sum(per_sample * w)
 
         # ===============================
         # Phase 1 — FULL batch
@@ -328,14 +345,13 @@ class NNPredictor(nn.Module):
         for _ in range(train_full):
             t = step_index / (total_steps - 1)
             lr = lr_end + 0.5 * (lr_start - lr_end) * (1 + math.cos(math.pi * t))
-
             for pg in self.optimizer.param_groups:
                 pg["lr"] = lr
 
             self.optimizer.zero_grad()
 
             pred = self.forward(x)
-            loss = self.loss(pred, y)
+            loss = weighted_loss(pred, y, bias_full)
 
             self.losses.append(loss.detach())
             loss.backward()
@@ -347,7 +363,6 @@ class NNPredictor(nn.Module):
         # ===============================
         # Phase 2 — SMALL refined subset
         # ===============================
-        # take the most recent `end_size` samples (or all if smaller)
         k = min(end_size, B)
         xs = x[-k:]
         ys = y[-k:]
@@ -355,14 +370,13 @@ class NNPredictor(nn.Module):
         for _ in range(train_end):
             t = step_index / (total_steps - 1)
             lr = lr_end + 0.5 * (lr_start - lr_end) * (1 + math.cos(math.pi * t))
-
             for pg in self.optimizer.param_groups:
                 pg["lr"] = lr
 
             self.optimizer.zero_grad()
 
             pred = self.forward(xs)
-            loss = self.loss(pred, ys)
+            loss = weighted_loss(pred, ys, bias_end)
 
             self.losses.append(loss.detach())
             loss.backward()
@@ -379,7 +393,6 @@ class NNPredictor(nn.Module):
             f"lr_final: {lr:.6f}  "
             f"phase2_batch: {k}"
         )
-
 
 
     # -------------------------------------------------
